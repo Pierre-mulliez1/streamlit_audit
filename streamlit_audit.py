@@ -217,6 +217,24 @@ def upload_yaml_to_named_stage(session, yaml_string: str, file_name: str) -> str
 
 
     
+def summarize_text(text: str) -> str:
+    """
+    Summarizes the provided text using a simple algorithm.
+    This is a placeholder for more complex summarization logic.
+    """
+    try:
+        escaped_prompt = text.replace("'", "") # Escape for SQL string literal
+        result = session.sql(f"SELECT SNOWFLAKE.CORTEX.SUMMARIZE('{escaped_prompt}') AS response_text").collect()
+
+        if result and result[0]['RESPONSE_TEXT']:
+                return result[0]['RESPONSE_TEXT']
+        else:
+                return "Cortex LLM returned an empty response."
+    except Exception as e:
+        logging.error(f"Exception calling Cortex LLM: {e}")
+        st.error(f"Error calling Cortex LLM for analysis: {e}")
+        return {"error": f"Error calling Cortex LLM: {e}"}
+
 
 def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
     """
@@ -241,7 +259,7 @@ def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
         st.error(f"Error calling Cortex LLM for analysis: {e}")
         return {"error": f"Error calling Cortex LLM: {e}"}
 
-def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None) -> None:
+def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False') -> None:
     """
     Processes a prompt, sends it to the Cortex LLM, and displays the response.
     semantic_model_path_for_info is just for display, not directly used by LLM.
@@ -263,8 +281,11 @@ def process_analyst_message(session: Session, prompt: str, semantic_model_path_f
         with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
             try:
                 # Call the updated send_message_to_analyst function
-                response = send_message_to_analyst(session=session, prompt_text=prompt)
-                
+                if stateful == 'False':
+                    response = send_message_to_analyst(session=session, prompt_text=prompt)
+                else:
+                    response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
+                    
                 if "error" in response:
                     st.error(f"LLM processing failed: {response['error']}")
                 else:
@@ -394,14 +415,34 @@ def display_conversation():
         content = message["content"]
         with st.chat_message(role):
             display_analyst_content(content=content)
-            
+
+def stateful_conversation():
+    text_appended = ''
+    if len(st.session_state.messages) == 0:
+        text_appended = ". No conversation history available."
+    else:
+        counter = 0
+        for idx, message in enumerate(st.session_state.messages):
+            role = message["role"]
+            for item_index, item in enumerate(message["content"]):
+                if item["type"] == "text":
+                    content = item["text"]
+            text_appended += '. Message: ' + str(counter)  + ', role: ' + role + ", value: " + content
+            counter += 1
+        if len(text_appended) > 500:
+            st.warning("Conversation is getting long. Consider clearing history for better performance. summarizing the conversation.")
+            text_appended = summarize_text(text_appended)
+    return text_appended
+
 # --- Streamlit App ---
 st.set_page_config(layout="wide")
 st.title("Snowflake Database Audit Tool ❄️")
 
-
-if st.session_state.messages is None:
-     # re initialise variable 
+try:
+    if st.session_state.messages is None:
+        # re initialise variable 
+        reset_session_state()
+except:
     reset_session_state()
     
 display_conversation()
@@ -414,7 +455,7 @@ if not session:
 
 user_input = st.chat_input("What is your question?")
 if user_input:
-    process_analyst_message(session=session, prompt=user_input)
+    process_analyst_message(session=session, prompt=  user_input, stateful = stateful_conversation() )
 
 # Center this button
 _, btn_container, _ = st.columns([2, 6, 2])
