@@ -429,9 +429,9 @@ def stateful_conversation():
                     content = item["text"]
             text_appended += '. Message: ' + str(counter)  + ', role: ' + role + ", value: " + content
             counter += 1
+            text_appended = summarize_text(text_appended)
         if len(text_appended) > 500:
             st.warning("Conversation is getting long. Consider clearing history for better performance. summarizing the conversation.")
-            text_appended = summarize_text(text_appended)
     return text_appended
 
 # --- Streamlit App ---
@@ -494,6 +494,7 @@ with st.sidebar:
     include_access_check = st.checkbox("Perform Access Checks", True)
     include_data_dictionary = st.checkbox("Generate Data Dictionary", True)
     include_workflow_dictionary = st.checkbox("Generate Workflow Dictionary", True)
+    include_cortex_analysis = st.checkbox("Analyze model", True)
     include_script_analysis = st.checkbox("Analyze Scripts (Views, Procedures, Tasks)", True)
     # include_service_analysis = st.checkbox("Analyze Service Usage", True) # Placeholder for future
     show_compute_consumption = st.checkbox("Show Compute Consumption")
@@ -791,7 +792,7 @@ if st.sidebar.button("Run Audit"):
 
 
     # --- 3. Script Analysis ---
-    if include_script_analysis:
+    if include_cortex_analysis:
         YAML_STAGE_NAME = "CORTEX_ANALYST_YAMLS" # Name of the shared stage
                 # --- App Configuration & State ---
         if "messages" not in st.session_state:
@@ -872,8 +873,7 @@ if st.sidebar.button("Run Audit"):
         st.header("Chat with Cortex Analyst")
 
 
-        include_script_analysis_expanded = st.checkbox("Expand search to scripts")
-        if include_script_analysis_expanded:
+        if include_script_analysis:
             with st.spinner("Analyzing Scripts with Cortex AI... (This can take time and incur costs)"):
                 st.markdown("## 🧠 Script Analysis (via Cortex AI)")
                 script_analysis_results = []
