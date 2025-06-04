@@ -259,7 +259,7 @@ def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
         st.error(f"Error calling Cortex LLM for analysis: {e}")
         return {"error": f"Error calling Cortex LLM: {e}"}
 
-def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False') -> None:
+def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False',analyse_query: bool = False) -> None:
     """
     Processes a prompt, sends it to the Cortex LLM, and displays the response.
     semantic_model_path_for_info is just for display, not directly used by LLM.
@@ -873,47 +873,46 @@ if st.sidebar.button("Run Audit"):
         st.header("Chat with Cortex Analyst")
 
 
-        if include_script_analysis:
-            with st.spinner("Analyzing Scripts with Cortex AI... (This can take time and incur costs)"):
-                st.markdown("## 🧠 Script Analysis (via Cortex AI)")
-                script_analysis_results = []
+    if include_script_analysis:
+        st.markdown("## 🧠 Script Analysis")
+        script_analysis_results = []
+        
+        # Using effective database/schema for filtering
+        db_scripts_cond = f"AND TABLE_CATALOG = '{current_audit_context['database']}'" if current_audit_context['database'] != 'N/A' else ""
+        schema_scripts_cond = f"AND TABLE_SCHEMA = '{current_audit_context['schema']}'" if current_audit_context['schema'] != 'N/A' else ""
+
+        # Analyze Views
+        views_to_analyze_df = fetch_data(session, f"SELECT TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE 1=1 {db_scripts_cond} {schema_scripts_cond} LIMIT 10") # Limit for cost/time
+        st.caption(f"Analyzing up to 10 views from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
+        for index, view in views_to_analyze_df.iterrows():
+            with st.expander(f"View: {view['TABLE_NAME']}"):
+                st.code(view['VIEW_DEFINITION'], language='sql')
+                analysis = analyze_sql_with_cortex(session, view['VIEW_DEFINITION'])
+                if "suggestions" in analysis:
+                    st.markdown("**Cortex Suggestions:**")
+                    st.text(analysis['suggestions'])
+                elif "error" in analysis:
+                    st.error(f"Cortex Analysis Error: {analysis['error']}")
+
+        # Analyze Stored Procedures
+        procs_to_analyze_df = fetch_data(session, f"SELECT PROCEDURE_NAME, PROCEDURE_DEFINITION, PROCEDURE_LANGUAGE FROM INFORMATION_SCHEMA.PROCEDURES WHERE 1=1 {db_scripts_cond.replace('TABLE_','PROCEDURE_')} {schema_scripts_cond.replace('TABLE_','PROCEDURE_')} LIMIT 5") # Limit
+        st.caption(f"Analyzing up to 5 procedures from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
+        for index, procedure in procs_to_analyze_df.iterrows():
+            with st.expander(f"Procedure: {procedure['PROCEDURE_NAME']} ({procedure['PROCEDURE_LANGUAGE']})"):
+                st.code(procedure['PROCEDURE_DEFINITION'], language=procedure['PROCEDURE_LANGUAGE'].lower())
+                if procedure['PROCEDURE_LANGUAGE'] == 'SQL':
+                    analysis = analyze_sql_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
+                elif procedure['PROCEDURE_LANGUAGE'] == 'PYTHON':
+                    analysis = analyze_python_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
+                else: # JAVA, SCALA
+                    analysis = {"suggestions": f"Automated analysis for {procedure['PROCEDURE_LANGUAGE']} procedures not yet implemented."}
                 
-                # Using effective database/schema for filtering
-                db_scripts_cond = f"AND TABLE_CATALOG = '{current_audit_context['database']}'" if current_audit_context['database'] != 'N/A' else ""
-                schema_scripts_cond = f"AND TABLE_SCHEMA = '{current_audit_context['schema']}'" if current_audit_context['schema'] != 'N/A' else ""
-
-                # Analyze Views
-                views_to_analyze_df = fetch_data(session, f"SELECT TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE 1=1 {db_scripts_cond} {schema_scripts_cond} LIMIT 10") # Limit for cost/time
-                st.caption(f"Analyzing up to 10 views from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
-                for index, view in views_to_analyze_df.iterrows():
-                    with st.expander(f"View: {view['TABLE_NAME']}"):
-                        st.code(view['VIEW_DEFINITION'], language='sql')
-                        analysis = analyze_sql_with_cortex(session, view['VIEW_DEFINITION'])
-                        if "suggestions" in analysis:
-                            st.markdown("**Cortex Suggestions:**")
-                            st.text(analysis['suggestions'])
-                        elif "error" in analysis:
-                            st.error(f"Cortex Analysis Error: {analysis['error']}")
-
-                # Analyze Stored Procedures
-                procs_to_analyze_df = fetch_data(session, f"SELECT PROCEDURE_NAME, PROCEDURE_DEFINITION, PROCEDURE_LANGUAGE FROM INFORMATION_SCHEMA.PROCEDURES WHERE 1=1 {db_scripts_cond.replace('TABLE_','PROCEDURE_')} {schema_scripts_cond.replace('TABLE_','PROCEDURE_')} LIMIT 5") # Limit
-                st.caption(f"Analyzing up to 5 procedures from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
-                for index, procedure in procs_to_analyze_df.iterrows():
-                    with st.expander(f"Procedure: {procedure['PROCEDURE_NAME']} ({procedure['PROCEDURE_LANGUAGE']})"):
-                        st.code(procedure['PROCEDURE_DEFINITION'], language=procedure['PROCEDURE_LANGUAGE'].lower())
-                        if procedure['PROCEDURE_LANGUAGE'] == 'SQL':
-                            analysis = analyze_sql_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
-                        elif procedure['PROCEDURE_LANGUAGE'] == 'PYTHON':
-                            analysis = analyze_python_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
-                        else: # JAVA, SCALA
-                            analysis = {"suggestions": f"Automated analysis for {procedure['PROCEDURE_LANGUAGE']} procedures not yet implemented."}
-                        
-                        if "suggestions" in analysis:
-                            st.markdown("**Cortex Suggestions:**")
-                            st.text(analysis['suggestions'])
-                        elif "error" in analysis:
-                            st.error(f"Cortex Analysis Error: {analysis['error']}")
-                st.markdown("---")
+                if "suggestions" in analysis:
+                    st.markdown("**Cortex Suggestions:**")
+                    st.text(analysis['suggestions'])
+                elif "error" in analysis:
+                    st.error(f"Cortex Analysis Error: {analysis['error']}")
+        st.markdown("---")
     
     # --- 4. Compute Consumption ---
     if show_compute_consumption:
