@@ -236,14 +236,62 @@ def summarize_text(text: str) -> str:
         return {"error": f"Error calling Cortex LLM: {e}"}
 
 
+
+
+def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False',query_name: str = None) -> None:
+    """
+    Processes a prompt, sends it to the Cortex LLM, and displays the response.
+    semantic_model_path_for_info is just for display, not directly used by LLM.
+    """
+    if not prompt:
+        st.error("Prompt cannot be empty.")
+        return
+   
+    if query_name is None:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+    else:
+        escaped_sql_query = prompt.replace("'", "''")
+        prompt = f"""
+        Analyze the following SQL query for organization, writing style, and variable naming.
+        Suggest improvements based on SQL best practices. Output should be a list of suggestions.
+
+        ```sql
+        {escaped_sql_query}
+        ```
+        """
+        with st.chat_message("user"):
+            st.markdown(f"**Query Analysis:** {prompt}")
+    try:
+        st.session_state.messages.append(
+        {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        )
+    except Exception as e: 
+        st.error(f"error getting access to session {e}")
+
+    with st.chat_message("assistant"):
+        with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
+            try:
+                # Call the updated send_message_to_analyst function
+                if stateful == 'False':
+                    response = send_message_to_analyst(session=session, prompt_text=prompt)
+                else:
+                    response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
+                if "error" in response:
+                    st.error(f"LLM processing failed: {response['error']}")
+                else:
+                    content = response["message"]["content"]
+                    display_analyst_content(content=content,query_name=query_name)
+                    st.session_state.messages.append({"role": "assistant", "content": content})
+            except Exception as e:
+                st.error(f"Failed to get full response from LLM due to an earlier error: {e}")
+
 def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
     """
     Sends a text prompt to a Snowflake Cortex LLM (e.g., snowflake-arctic)
     to get a text-based response for analysis/suggestions.
     """
     try:
-        
-        # If get_active_session() works, assume _snowflake is implicitly available for Cortex functions
 
         escaped_prompt = prompt_text.replace("'", "''") # Escape for SQL string literal
         
@@ -258,44 +306,8 @@ def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
         logging.error(f"Exception calling Cortex LLM: {e}")
         st.error(f"Error calling Cortex LLM for analysis: {e}")
         return {"error": f"Error calling Cortex LLM: {e}"}
-
-def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False',analyse_query: bool = False) -> None:
-    """
-    Processes a prompt, sends it to the Cortex LLM, and displays the response.
-    semantic_model_path_for_info is just for display, not directly used by LLM.
-    """
-    if not prompt:
-        st.error("Prompt cannot be empty.")
-        return
-    try:
-        st.session_state.messages.append(
-        {"role": "user", "content": [{"type": "text", "text": prompt}]}
-        )
-    except Exception as e: 
-        st.error(f"error getting access to session {e}")
-
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
-            try:
-                # Call the updated send_message_to_analyst function
-                if stateful == 'False':
-                    response = send_message_to_analyst(session=session, prompt_text=prompt)
-                else:
-                    response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
-                    
-                if "error" in response:
-                    st.error(f"LLM processing failed: {response['error']}")
-                else:
-                    content = response["message"]["content"]
-                    display_analyst_content(content=content)
-                    st.session_state.messages.append({"role": "assistant", "content": content})
-            except Exception as e:
-                st.error(f"Failed to get full response from LLM due to an earlier error: {e}")
-
-def display_analyst_content(content: list, message_index: int = None) -> None:
+    
+def display_analyst_content(content: list, message_index: int = None,query_name: str = None) -> None:
     effective_message_index = message_index if message_index is not None else len(st.session_state.get("messages", []))
     for item_index, item in enumerate(content):
         if item["type"] == "text":
@@ -354,27 +366,6 @@ def analyze_text_with_cortex(session, text, prompt_suffix):
     except Exception as e:
         return {"error": f"Error during Cortex analysis for {prompt_suffix}: {e}"}
 
-def analyze_sql_with_cortex(session, sql_query):
-    """Analyzes SQL using Snowflake Cortex for style and organization."""
-    try:
-        escaped_sql_query = sql_query.replace("'", "''")
-        prompt = f"""
-        Analyze the following SQL query for organization, writing style, and variable naming.
-        Suggest improvements based on SQL best practices. Output should be a list of suggestions.
-
-        ```sql
-        {escaped_sql_query}
-        ```
-        """
-        escaped_prompt = prompt.replace("'", "''")
-        # Using snowflake-arctic for potentially better structured output or more control
-        result = session.sql(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('snowflake-arctic', '{escaped_prompt}') AS analysis").collect()
-        if result and result[0]['ANALYSIS']:
-            return {"suggestions": result[0]['ANALYSIS']} # Raw output from COMPLETE
-        else:
-            return {"suggestions": "No specific style/organization suggestions found from Cortex."}
-    except Exception as e:
-        return {"error": f"Error during Cortex SQL analysis: {e}"}
 
 def analyze_python_with_cortex(session, python_code):
     """Analyzes Python using Snowflake Cortex for style and organization."""
@@ -430,7 +421,7 @@ def stateful_conversation():
             text_appended += '. Message: ' + str(counter)  + ', role: ' + role + ", value: " + content
             counter += 1
             text_appended = summarize_text(text_appended)
-        if len(text_appended) > 500:
+        if counter > 20:
             st.warning("Conversation is getting long. Consider clearing history for better performance. summarizing the conversation.")
     return text_appended
 
@@ -456,8 +447,8 @@ if not session:
 user_input = st.chat_input("What is your question?")
 if user_input:
     process_analyst_message(session=session, prompt=  user_input, stateful = stateful_conversation() )
-
-# Center this button
+    
+# Button to clear chat history
 _, btn_container, _ = st.columns([2, 6, 2])
 if btn_container.button("Clear Chat History", use_container_width=True):
     reset_session_state()
@@ -887,12 +878,8 @@ if st.sidebar.button("Run Audit"):
         for index, view in views_to_analyze_df.iterrows():
             with st.expander(f"View: {view['TABLE_NAME']}"):
                 st.code(view['VIEW_DEFINITION'], language='sql')
-                analysis = analyze_sql_with_cortex(session, view['VIEW_DEFINITION'])
-                if "suggestions" in analysis:
-                    st.markdown("**Cortex Suggestions:**")
-                    st.text(analysis['suggestions'])
-                elif "error" in analysis:
-                    st.error(f"Cortex Analysis Error: {analysis['error']}")
+                process_analyst_message(session=session, prompt=view['VIEW_DEFINITION'], query_name=view['VIEW_DEFINITION']) # Using the same function to process the view definition
+                
 
         # Analyze Stored Procedures
         procs_to_analyze_df = fetch_data(session, f"SELECT PROCEDURE_NAME, PROCEDURE_DEFINITION, PROCEDURE_LANGUAGE FROM INFORMATION_SCHEMA.PROCEDURES WHERE 1=1 {db_scripts_cond.replace('TABLE_','PROCEDURE_')} {schema_scripts_cond.replace('TABLE_','PROCEDURE_')} LIMIT 5") # Limit
@@ -901,7 +888,7 @@ if st.sidebar.button("Run Audit"):
             with st.expander(f"Procedure: {procedure['PROCEDURE_NAME']} ({procedure['PROCEDURE_LANGUAGE']})"):
                 st.code(procedure['PROCEDURE_DEFINITION'], language=procedure['PROCEDURE_LANGUAGE'].lower())
                 if procedure['PROCEDURE_LANGUAGE'] == 'SQL':
-                    analysis = analyze_sql_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
+                    process_analyst_message(session=session, prompt=view['VIEW_DEFINITION'], query_name=True)
                 elif procedure['PROCEDURE_LANGUAGE'] == 'PYTHON':
                     analysis = analyze_python_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
                 else: # JAVA, SCALA
