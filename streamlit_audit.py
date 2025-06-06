@@ -12,6 +12,9 @@ import datetime as dt
 import yaml
 from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark.exceptions import SnowparkSQLException
+import logging
+from typing import List, Dict, Optional
+from collections import defaultdict
 
 
 
@@ -425,6 +428,261 @@ def stateful_conversation():
             st.warning("Conversation is getting long. Consider clearing history for better performance. summarizing the conversation.")
     return text_appended
 
+def list_scriptable_objects(
+    session: Session, 
+    database_name: str, 
+    schema_name: str, 
+    limit_per_type: Optional[int] = 10
+) -> List[Dict]:
+    """
+    DISCOVERY FUNCTION: Lists all scriptable objects in a schema and their owners.
+    """
+    discovered_objects = []
+    
+    # Configuration now includes the 'owner_col' for each object type
+    object_configs = [
+        {"type": "VIEW", "ddl_name": "VIEW", "info_schema_view": "VIEWS", "name_col": "TABLE_NAME", "schema_col": "TABLE_SCHEMA", "owner_col": "TABLE_OWNER"},
+        {"type": "MATERIALIZED VIEW", "ddl_name": "VIEW", "info_schema_view": "MATERIALIZED_VIEWS", "name_col": "TABLE_NAME", "schema_col": "TABLE_SCHEMA", "owner_col": "TABLE_OWNER"},
+        {"type": "FUNCTION", "ddl_name": "FUNCTION", "info_schema_view": "FUNCTIONS", "name_col": "FUNCTION_NAME", "schema_col": "FUNCTION_SCHEMA", "owner_col": "FUNCTION_OWNER", "signature_col": "ARGUMENT_SIGNATURE", "lang_col": "LANGUAGE"},
+        {"type": "PROCEDURE", "ddl_name": "PROCEDURE", "info_schema_view": "PROCEDURES", "name_col": "PROCEDURE_NAME", "schema_col": "PROCEDURE_SCHEMA", "owner_col": "PROCEDURE_OWNER", "signature_col": "ARGUMENT_SIGNATURE", "lang_col": "PROCEDURE_LANGUAGE"},
+        {"type": "PIPE", "ddl_name": "PIPE", "info_schema_view": "PIPES", "name_col": "PIPE_NAME", "schema_col": "PIPE_SCHEMA", "owner_col": "PIPE_OWNER"},
+        {"type": "TASK", "ddl_name": "TASK", "info_schema_view": "TASKS", "name_col": "NAME", "schema_col": "SCHEMA_NAME", "owner_col": "OWNER"},
+        {"type": "STREAM", "ddl_name": "STREAM", "info_schema_view": "STREAMS", "name_col": "STREAM_NAME", "schema_col": "STREAM_SCHEMA", "owner_col": "OWNER"},
+        {"type": "DYNAMIC TABLE", "ddl_name": "DYNAMIC TABLE", "info_schema_view": "DYNAMIC_TABLES", "name_col": "NAME", "schema_col": "SCHEMA_NAME", "owner_col": "OWNER"},
+    ]
+
+    logging.info(f"Starting object discovery for {database_name}.{schema_name}...")
+    limit_clause = f"LIMIT {limit_per_type}" if limit_per_type is not None else ""
+
+    for config in object_configs:
+        try:
+            query_cols = [config['name_col'], config['owner_col']] # Add owner_col to SELECT
+            if 'signature_col' in config: query_cols.append(config['signature_col'])
+            if 'lang_col' in config: query_cols.append(config['lang_col'])
+            
+            query = f"SELECT {', '.join(query_cols)} FROM {database_name}.INFORMATION_SCHEMA.{config['info_schema_view']} WHERE {config['schema_col']} = '{schema_name.upper()}' {limit_clause}"
+            
+            rows = session.sql(query).collect()
+            if not rows: continue
+
+            for row in rows:
+                object_name_val = row[config['name_col']]
+                owner = row[config['owner_col']]
+                lang_col_name = config.get('lang_col')
+                language = row[lang_col_name] if lang_col_name and lang_col_name in row.as_dict() else 'SQL'
+
+                if 'signature_col' in config:
+                    full_name_for_ddl = f'"{object_name_val}"{row[config["signature_col"]]}'
+                    display_name = f'{object_name_val}{row[config["signature_col"]]}'
+                else:
+                    full_name_for_ddl = f'"{object_name_val}"'
+                    display_name = object_name_val
+                
+                discovered_objects.append({
+                    "display_name": display_name,
+                    "full_name_for_ddl": full_name_for_ddl,
+                    "object_type_for_ddl": config['ddl_name'],
+                    "object_type_display": config['type'],
+                    "language": language,
+                    "owner": owner, # Store the owner
+                })
+        except SnowparkSQLException as e:
+            logging.warning(f"Could not list {config['type']}s. Skipping. Error: {e.message.strip()}")
+
+    logging.info(f"Discovery finished. Found {len(discovered_objects)} potential objects.")
+    return discovered_objects
+
+def get_direct_grants(session: Session, object_type: str, fqn: str) -> List[Dict]:
+    """
+    Gets the direct grants for a specific Snowflake object.
+    
+    Note: This does not show inherited grants through role hierarchies.
+    """
+    grants = []
+    try:
+        # The object type for SHOW GRANTS can sometimes differ from GET_DDL
+        # e.g., MATERIALIZED VIEW is just VIEW. We'll handle this simply.
+        show_type = "VIEW" if object_type == "MATERIALIZED VIEW" else object_type
+        
+        # Use single quotes to handle special characters in FQN
+        query = f"SHOW GRANTS ON {show_type} '{fqn}'"
+        grants_df = session.sql(query).collect()
+        for row in grants_df:
+            grants.append({
+                "privilege": row['privilege'],
+                "grantee_name": row['grantee_name'],
+                "granted_on": row['granted_on']
+            })
+    except SnowparkSQLException as e:
+        logging.error(f"Could not get grants for {fqn}. Your role may lack privileges. Error: {e.message.strip()}")
+    return grants
+
+def scrape_object_definitions(
+    session: Session, 
+    database_name: str, 
+    schema_name: str, 
+    objects_to_scrape: List[Dict]
+) -> List[Dict]:
+    """
+    EXTRACTION FUNCTION: Scrapes the DDL for a provided list of objects.
+
+    Iterates through a list of pre-discovered objects and uses GET_DDL
+    to fetch their creation code.
+
+    Args:
+        session: The active Snowpark session object.
+        database_name: The database where the objects reside.
+        schema_name: The schema where the objects reside.
+        objects_to_scrape: The list of objects from list_scriptable_objects().
+
+    Returns:
+        A list of dictionaries, now including the 'definition' for each object.
+    """
+    scraped_definitions = []
+    logging.info(f"Starting DDL scraping for {len(objects_to_scrape)} objects...")
+
+    for obj in objects_to_scrape:
+        try:
+            ddl_query = f"SELECT GET_DDL('{obj['object_type_for_ddl']}', '{database_name}.{schema_name}.{obj['full_name_for_ddl']}') AS DDL"
+            ddl_result = session.sql(ddl_query).collect()
+            
+            if ddl_result and ddl_result[0]['DDL']:
+                # Append the full object details along with its definition
+                final_object_data = {
+                    'object_name': obj['display_name'],
+                    'object_type': obj['object_type_display'],
+                    'definition': ddl_result[0]['DDL'],
+                    'language': obj['language']
+                }
+                scraped_definitions.append(final_object_data)
+                logging.info(f"Successfully scraped DDL for {obj['display_name']}")
+            else:
+                logging.warning(f"GET_DDL returned empty result for {obj['display_name']}")
+        except SnowparkSQLException as e:
+            logging.error(f"Could not get DDL for {obj['display_name']}. Error: {e.message.strip()}")
+            
+    logging.info(f"Finished scraping. Retrieved {len(scraped_definitions)} definitions.")
+    return scraped_definitions
+
+def get_cortex_summary(session: Session, object_definition: str) -> str:
+    """
+    Uses the application's existing Cortex logic to generate a summary of an object's purpose.
+
+    Args:
+        session (Session): The active Snowpark session.
+        object_definition (str): The DDL/code of the Snowflake object.
+
+    Returns:
+        str: A plain-text summary of the object's purpose.
+    """
+    try:
+        # 1. Create a precise prompt for the LLM for this specific task.
+        prompt = f"""
+        Analyze the following SQL DDL and describe the business purpose of this object in one or two concise sentences. 
+        Focus on what it does, not how it's built.
+
+        DDL:
+        ```sql
+        {object_definition}
+        ```
+        """
+        
+        # 2. Reuse the existing backend function to call the Cortex API.
+        response_dict = send_message_to_analyst(session=session, prompt_text=prompt)
+        
+        # 3. Extract the text content from the response dictionary.
+        if "error" not in response_dict:
+            # The structure is based on your 'send_message_to_analyst' function's return value
+            content_list = response_dict.get("message", {}).get("content", [])
+            if content_list and content_list[0].get("type") == "text":
+                return content_list[0].get("text", "").strip()
+        else:
+            logging.error(f"Cortex summary failed: {response_dict['error']}")
+            return f"*AI summary could not be generated due to an error: {response_dict['error']}*"
+
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in get_cortex_summary: {e}")
+        return "*AI summary could not be generated due to an unexpected error.*"
+    
+    return "*AI summary could not be generated.*"
+
+def generate_technical_documentation(
+    semantic_model_yaml: str, 
+    object_definitions: List[Dict], 
+    database_name: str, 
+    schema_name: str
+) -> str:
+    """
+    Generates a clean technical documentation document in Markdown format.
+
+    This function combines a high-level schema definition (from a YAML semantic model)
+    with the detailed DDL code for programmatic objects (views, procedures, etc.)
+    to create a single, comprehensive document.
+
+    Args:
+        semantic_model_yaml (str): A string containing the YAML definition of the schema.
+        object_definitions (List[Dict]): The list of scraped object definitions from 
+                                         the scrape_object_definitions() function.
+        database_name (str): The name of the database being documented.
+        schema_name (str): The name of the schema being documented.
+
+    Returns:
+        str: A single string containing the full documentation in Markdown format.
+    """
+    doc_parts = []
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # --- 1. Document Header ---
+    doc_parts.append(f"# Technical Documentation: {database_name}.{schema_name}")
+    doc_parts.append(f"**Generated on:** {now}\n\n---\n")
+    doc_parts.append("## Overview")
+    doc_parts.append("This document provides a detailed overview of the data model, schema objects, and programmatic logic contained within the specified Snowflake schema.")
+
+    # --- 2. Process the Data Model from YAML ---
+    doc_parts.append("\n## Data Model / Schema Objects")
+    try:
+        # Parse the YAML string into a Python dictionary
+        schema_data = yaml.safe_load(semantic_model_yaml)
+        if schema_data and 'entities' in schema_data:
+            for entity in schema_data.get('entities', []):
+                doc_parts.append(f"\n### {entity.get('type', 'OBJECT')}: `{entity.get('name', 'N/A')}`")
+                if entity.get('description'):
+                    doc_parts.append(f"> {entity['description']}")
+                
+                doc_parts.append("\n**Columns:**")
+                # Create a Markdown table for columns
+                doc_parts.append("| Column Name | Datatype | Description |")
+                doc_parts.append("|-------------|----------|-------------|")
+                for col in entity.get('columns', []):
+                    col_name = col.get('name', 'N/A')
+                    col_type = col.get('datatype', 'N/A')
+                    col_desc = col.get('description', '*No description provided.*')
+                    doc_parts.append(f"| `{col_name}` | `{col_type}` | {col_desc} |")
+        else:
+            doc_parts.append("_Could not find any table or view entities in the semantic model._")
+    except yaml.YAMLError as e:
+        doc_parts.append(f"**Warning:** Could not parse the semantic model YAML. Error: {e}")
+        doc_parts.append("```yaml\n" + semantic_model_yaml + "\n```")
+
+    # --- 3. Process Programmatic & Workflow Objects ---
+    doc_parts.append(f"\n\n---\n## Programmatic & Workflow Objects")
+    if not object_definitions:
+        doc_parts.append("_No programmatic objects (views, procedures, etc.) were found or accessible._")
+    else:
+        # Group objects by their type for cleaner organization
+        grouped_objects = defaultdict(list)
+        for obj in object_definitions:
+            grouped_objects[obj['object_type']].append(obj)
+        
+        for object_type, objects in grouped_objects.items():
+            doc_parts.append(f"\n### {object_type}s")
+            for obj in objects:
+                doc_parts.append(f"\n#### `{obj['object_name']}`")
+                doc_parts.append(f"**Language:** {obj.get('language', 'SQL')}")
+                doc_parts.append(f"```sql\n{obj['definition']}\n```")
+
+    return "\n".join(doc_parts)
+
 # --- Streamlit App ---
 st.set_page_config(layout="wide")
 st.title("Snowflake Database Audit Tool ❄️")
@@ -482,11 +740,12 @@ with st.sidebar:
     st.header("Audit Options")
     audit_tags_input = st.text_input("Object/Column Tag Keys (comma-separated)", placeholder="e.g., PII_STATUS,DATA_OWNER")
     
-    include_access_check = st.checkbox("Perform Access Checks", True)
-    include_data_dictionary = st.checkbox("Generate Data Dictionary", True)
-    include_workflow_dictionary = st.checkbox("Generate Workflow Dictionary", True)
-    include_cortex_analysis = st.checkbox("Analyze model", True)
-    include_script_analysis = st.checkbox("Analyze Scripts (Views, Procedures, Tasks)", True)
+    include_access_check = st.checkbox("Perform Access Checks")
+    include_data_dictionary = st.checkbox("Generate Data Dictionary")
+    include_workflow_dictionary = st.checkbox("Generate Workflow Dictionary")
+    include_cortex_analysis = st.checkbox("Analyze model")
+    include_script_analysis = st.checkbox("Analyze Scripts (Views, Procedures, Tasks)")
+    include_tech_docs = st.checkbox("Generate Full Technical Documentation")
     # include_service_analysis = st.checkbox("Analyze Service Usage", True) # Placeholder for future
     show_compute_consumption = st.checkbox("Show Compute Consumption")
     if show_compute_consumption:
@@ -865,42 +1124,114 @@ if st.sidebar.button("Run Audit"):
 
 
     if include_script_analysis:
-        st.markdown("## 🧠 Script Analysis")
-        script_analysis_results = []
+        st.markdown("## 🧠 Script Analysis (via Cortex AI)")
         
-        # Using effective database/schema for filtering
-        db_scripts_cond = f"AND TABLE_CATALOG = '{current_audit_context['database']}'" if current_audit_context['database'] != 'N/A' else ""
-        schema_scripts_cond = f"AND TABLE_SCHEMA = '{current_audit_context['schema']}'" if current_audit_context['schema'] != 'N/A' else ""
+        # Step 1: DISCOVER all scriptable objects in the schema.
+        with st.spinner(f"Discovering objects in `{current_audit_context['database']}`.`{current_audit_context['schema']}`..."):
+            discovered_objects = list_scriptable_objects(
+                session=session,
+                database_name=current_audit_context['database'],
+                schema_name=current_audit_context['schema'],
+                limit_per_type=10  # A sensible default to control cost and time
+            )
 
-        # Analyze Views
-        views_to_analyze_df = fetch_data(session, f"SELECT TABLE_NAME, VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE 1=1 {db_scripts_cond} {schema_scripts_cond} LIMIT 10") # Limit for cost/time
-        st.caption(f"Analyzing up to 10 views from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
-        for index, view in views_to_analyze_df.iterrows():
-            with st.expander(f"View: {view['TABLE_NAME']}"):
-                st.code(view['VIEW_DEFINITION'], language='sql')
-                process_analyst_message(session=session, prompt=view['VIEW_DEFINITION'], query_name=view['VIEW_DEFINITION']) # Using the same function to process the view definition
-                
+        if not discovered_objects:
+            st.info("No script objects (Views, Procedures, etc.) were found or are accessible in the specified schema.")
+        else:
+            # Step 2: EXTRACT the DDL for the objects we found.
+            with st.spinner(f"Scraping definitions for {len(discovered_objects)} objects..."):
+                all_definitions = scrape_object_definitions(
+                    session=session,
+                    database_name=current_audit_context['database'],
+                    schema_name=current_audit_context['schema'],
+                    objects_to_scrape=discovered_objects
+                )
 
-        # Analyze Stored Procedures
-        procs_to_analyze_df = fetch_data(session, f"SELECT PROCEDURE_NAME, PROCEDURE_DEFINITION, PROCEDURE_LANGUAGE FROM INFORMATION_SCHEMA.PROCEDURES WHERE 1=1 {db_scripts_cond.replace('TABLE_','PROCEDURE_')} {schema_scripts_cond.replace('TABLE_','PROCEDURE_')} LIMIT 5") # Limit
-        st.caption(f"Analyzing up to 5 procedures from `{current_audit_context['database']}`.`{current_audit_context['schema']}`...")
-        for index, procedure in procs_to_analyze_df.iterrows():
-            with st.expander(f"Procedure: {procedure['PROCEDURE_NAME']} ({procedure['PROCEDURE_LANGUAGE']})"):
-                st.code(procedure['PROCEDURE_DEFINITION'], language=procedure['PROCEDURE_LANGUAGE'].lower())
-                if procedure['PROCEDURE_LANGUAGE'] == 'SQL':
-                    process_analyst_message(session=session, prompt=view['VIEW_DEFINITION'], query_name=True)
-                elif procedure['PROCEDURE_LANGUAGE'] == 'PYTHON':
-                    analysis = analyze_python_with_cortex(session, procedure['PROCEDURE_DEFINITION'])
-                else: # JAVA, SCALA
-                    analysis = {"suggestions": f"Automated analysis for {procedure['PROCEDURE_LANGUAGE']} procedures not yet implemented."}
-                
-                if "suggestions" in analysis:
-                    st.markdown("**Cortex Suggestions:**")
-                    st.text(analysis['suggestions'])
-                elif "error" in analysis:
-                    st.error(f"Cortex Analysis Error: {analysis['error']}")
+            st.success(f"Found and analyzed {len(all_definitions)} script objects.")
+            
+            # Step 3: PROCESS each definition with Cortex.
+            for obj in all_definitions:
+                obj_type = obj['object_type']
+                obj_name = obj['object_name']
+                obj_def = obj['definition']
+                obj_lang = obj.get('language', 'SQL')
+
+                with st.expander(f"**{obj_type}:** {obj_name} ({obj_lang})"):
+                    st.code(obj_def, language=obj_lang.lower())
+                    
+                    analysis_prompt = f"""
+                    Please perform a detailed analysis of the following Snowflake object.
+                    Object Name: '{obj_name}'
+                    Object Type: {obj_type}
+                    Language: {obj_lang}
+
+                    Analyze the code for correctness, performance, style, and adherence to Snowflake best practices.
+                    Provide a summary of its purpose and a list of actionable suggestions for improvement.
+
+                    --- CODE DEFINITION ---
+                    {obj_def}
+                    --- END CODE DEFINITION ---
+                    """
+                    
+                    process_analyst_message(
+                        session=session,
+                        prompt=analysis_prompt,
+                        semantic_model_path_for_info=st.session_state.get('generated_yaml_path') 
+                    )
+
         st.markdown("---")
     
+    # --- 5. Generate Full Technical Documentation ---
+    if include_tech_docs:
+        with st.container(border=True):
+            st.markdown("## 📄 Full Technical Documentation")
+            
+            with st.spinner("Generating full technical documentation... This may involve multiple steps."):
+                st.write("Step 1/4: Generating semantic model...")
+                yaml_content_string = generate_semantic_model_yaml_string(session, current_audit_context['database'], current_audit_context['schema'])
+                
+                st.write("Step 2/4: Discovering objects and owners...")
+                discovered_objects = list_scriptable_objects(
+                    session=session,
+                    database_name=current_audit_context['database'],
+                    schema_name=current_audit_context['schema'],
+                    limit_per_type=None
+                )
+                
+                st.write(f"Step 3/4: Scraping definitions, grants, and AI summaries for {len(discovered_objects)} objects...")
+                all_definitions = scrape_object_definitions(
+                    session=session,
+                    database_name=current_audit_context['database'],
+                    schema_name=current_audit_context['schema'],
+                    objects_to_scrape=discovered_objects
+                )
+
+                if yaml_content_string and all_definitions:
+                    st.write("Step 4/4: Assembling final documentation...")
+                    technical_doc_md = generate_technical_documentation(
+                        semantic_model_yaml=yaml_content_string,
+                        object_definitions=all_definitions,
+                        database_name=current_audit_context['database'],
+                        schema_name=current_audit_context['schema']
+                    )
+                    
+                    st.success("Technical documentation generated successfully!")
+                    
+                    # Display the documentation in an expander
+                    with st.expander("View Generated Documentation", expanded=True):
+                        st.markdown(technical_doc_md)
+
+                    # Provide a download button
+                    st.download_button(
+                        label="Download Documentation (Markdown)",
+                        data=technical_doc_md,
+                        file_name=f"technical_docs_{current_audit_context['database']}_{current_audit_context['schema']}.md",
+                        mime="text/markdown",
+                    )
+                else:
+                    st.error("Could not generate full documentation because either the semantic model or object definitions could not be retrieved.")
+        st.markdown("---")
+
     # --- 4. Compute Consumption ---
     if show_compute_consumption:
         with st.spinner("Fetching Compute Consumption Data..."):
