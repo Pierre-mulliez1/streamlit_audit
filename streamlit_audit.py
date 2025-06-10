@@ -441,6 +441,7 @@ def list_scriptable_objects(
     
     # Configuration now includes the 'owner_col' for each object type
     object_configs = [
+        {"type": "TABLE", "ddl_name": "TABLE", "info_schema_view": "TABLES", "name_col": "TABLE_NAME", "schema_col": "TABLE_SCHEMA", "owner_col": "TABLE_OWNER"},
         {"type": "VIEW", "ddl_name": "VIEW", "info_schema_view": "VIEWS", "name_col": "TABLE_NAME", "schema_col": "TABLE_SCHEMA", "owner_col": "TABLE_OWNER"},
         {"type": "MATERIALIZED VIEW", "ddl_name": "VIEW", "info_schema_view": "MATERIALIZED_VIEWS", "name_col": "TABLE_NAME", "schema_col": "TABLE_SCHEMA", "owner_col": "TABLE_OWNER"},
         {"type": "FUNCTION", "ddl_name": "FUNCTION", "info_schema_view": "FUNCTIONS", "name_col": "FUNCTION_NAME", "schema_col": "FUNCTION_SCHEMA", "owner_col": "FUNCTION_OWNER", "signature_col": "ARGUMENT_SIGNATURE", "lang_col": "LANGUAGE"},
@@ -460,7 +461,7 @@ def list_scriptable_objects(
             if 'signature_col' in config: query_cols.append(config['signature_col'])
             if 'lang_col' in config: query_cols.append(config['lang_col'])
             
-            query = f"SELECT {', '.join(query_cols)} FROM {database_name}.INFORMATION_SCHEMA.{config['info_schema_view']} WHERE {config['schema_col']} = '{schema_name.upper()}' {limit_clause}"
+            query = f"SELECT {', '.join(query_cols)} FROM {database_name}.INFORMATION_SCHEMA.{config['info_schema_view']}  {limit_clause}"
             
             rows = session.sql(query).collect()
             if not rows: continue
@@ -628,6 +629,14 @@ def generate_technical_documentation(
 
     Returns:
         str: A single string containing the full documentation in Markdown format.
+    It should contain the following sections:
+        - Document Header with database and schema names, generation date
+        - Deduced description of the schema from the YAML
+        - relationship between objects and their purpose (like data lienage, dataflow ...)
+        - Programmatic objects (views, procedures, etc.) with their DDL code
+        - Programmatic objects' purpose summaries using Cortex LLM
+        - Warnings for any issues encountered during processing
+        - role and privilege information for each object
     """
     doc_parts = []
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -649,15 +658,25 @@ def generate_technical_documentation(
                 if entity.get('description'):
                     doc_parts.append(f"> {entity['description']}")
                 
+                
+
                 doc_parts.append("\n**Columns:**")
                 # Create a Markdown table for columns
+                col_entity = ''
                 doc_parts.append("| Column Name | Datatype | Description |")
                 doc_parts.append("|-------------|----------|-------------|")
                 for col in entity.get('columns', []):
+                    col_entity = col_entity + col.get('name', 'N/A') + ' , '
                     col_name = col.get('name', 'N/A')
                     col_type = col.get('datatype', 'N/A')
                     col_desc = col.get('description', '*No description provided.*')
                     doc_parts.append(f"| `{col_name}` | `{col_type}` | {col_desc} |")
+                doc_parts.append("\n")
+                description_sql = send_message_to_analyst(session = session, prompt_text= 'Deduce the purpose of the table or view from the columns names ' + col_entity)
+                content = description_sql["message"]["content"]
+                for item_index, item in enumerate(content):
+                    doc_parts.append(item["text"])
+                
         else:
             doc_parts.append("_Could not find any table or view entities in the semantic model._")
     except yaml.YAMLError as e:
