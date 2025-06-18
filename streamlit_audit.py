@@ -16,7 +16,7 @@ import logging
 from typing import List, Dict, Optional
 from collections import defaultdict
 
-
+# ------------------------------------------------ APP FUNCTIONS ------------------------------------------------
 
 # --- Initialize Snowpark Session from Streamlit in Snowflake ---
 def get_snowpark_session_sis():
@@ -25,7 +25,6 @@ def get_snowpark_session_sis():
     except Exception as e:
         st.error(f"Error getting Snowpark session in Streamlit in Snowflake: {e}")
         return None
-
 def get_snowflake_environment_sis(session: Session):
     try:
         # Fetch initial environment. We'll use these as defaults.
@@ -42,6 +41,7 @@ def get_snowflake_environment_sis(session: Session):
         st.error(f"Error getting initial Snowflake environment info: {e}")
         return None
 
+# --- Named Stage Management ---
 def ensure_named_stage_exists(session, db_name: str, schema_name: str, stage_name: str):
     """
     Checks if a named stage exists and creates it if it doesn't.
@@ -66,8 +66,7 @@ def ensure_named_stage_exists(session, db_name: str, schema_name: str, stage_nam
         st.error("Please ensure the active role has CREATE SCHEMA and CREATE STAGE privileges in the specified database/schema.")
         return False
 
-# --- Schema Introspection and YAML Generation ---
-
+# --- Schema Introspection ---
 def get_schema_details(session, db_name: str, schema_name: str) -> list:
     """Queries INFORMATION_SCHEMA to get details of tables and views."""
     entities = []
@@ -169,6 +168,7 @@ def get_schema_details(session, db_name: str, schema_name: str) -> list:
             entity["columns"] = []
     return entities
 
+# --- YAML Generation and Upload to stage ---
 def generate_semantic_model_yaml_string(session, db_name: str, schema_name: str) -> str | None:
     """Generates a YAML string representing the schema of the target database and schema."""
     st.write(f"Generating YAML for: `{db_name}`.`{schema_name}`...")
@@ -216,10 +216,7 @@ def upload_yaml_to_named_stage(session, yaml_string: str, file_name: str) -> str
         if os.path.exists(local_file_path):
             os.remove(local_file_path)
 
-# --- Core Functions (send_message_to_analyst, process_analyst_message, display_analyst_content) ---
-
-
-    
+# --- Get Cortex Summary for stateful conversation, LSTM like ---
 def summarize_text(text: str) -> str:
     """
     Summarizes the provided text using a simple algorithm.
@@ -238,10 +235,8 @@ def summarize_text(text: str) -> str:
         st.error(f"Error calling Cortex LLM for analysis: {e}")
         return {"error": f"Error calling Cortex LLM: {e}"}
 
-
-
-
-def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False',query_name: str = None) -> None:
+# --- handle cortex messages accross varying context---
+def process_analyst_message(session: Session, prompt: str, semantic_model_path_for_info: str = None, stateful: str = 'False',obj_def: str = None,obj_type: str = None,obj_lang: str = None,obj_name: str = None) -> None:
     """
     Processes a prompt, sends it to the Cortex LLM, and displays the response.
     semantic_model_path_for_info is just for display, not directly used by LLM.
@@ -249,46 +244,59 @@ def process_analyst_message(session: Session, prompt: str, semantic_model_path_f
     if not prompt:
         st.error("Prompt cannot be empty.")
         return
-   
-    if query_name is None:
-        with st.chat_message("user"):
-            st.markdown(prompt)
-    else:
-        escaped_sql_query = prompt.replace("'", "''")
-        prompt = f"""
-        Analyze the following SQL query for organization, writing style, and variable naming.
-        Suggest improvements based on SQL best practices. Output should be a list of suggestions.
-
-        ```sql
-        {escaped_sql_query}
-        ```
-        """
-        with st.chat_message("user"):
-            st.markdown(f"**Query Analysis:** {prompt}")
-    try:
-        st.session_state.messages.append(
-        {"role": "user", "content": [{"type": "text", "text": prompt}]}
-        )
-    except Exception as e: 
-        st.error(f"error getting access to session {e}")
-
-    with st.chat_message("assistant"):
-        with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
+    if obj_name is not None: 
+        with st.expander(f"**{obj_type}:** {obj_name} ({obj_lang})"):
+            st.code(obj_def, language=obj_lang.lower())
             try:
-                # Call the updated send_message_to_analyst function
-                if stateful == 'False':
-                    response = send_message_to_analyst(session=session, prompt_text=prompt)
-                else:
-                    response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
-                if "error" in response:
-                    st.error(f"LLM processing failed: {response['error']}")
-                else:
-                    content = response["message"]["content"]
-                    display_analyst_content(content=content,query_name=query_name)
-                    st.session_state.messages.append({"role": "assistant", "content": content})
-            except Exception as e:
-                st.error(f"Failed to get full response from LLM due to an earlier error: {e}")
+                st.session_state.messages.append(
+                {"role": "user", "content": [{"type": "text", "text": prompt}]}
+                )
+            except Exception as e: 
+                st.error(f"error getting access to session {e}")
+        
+            with st.chat_message("assistant"):
+                with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
+                    try:
+                        # Call the updated send_message_to_analyst function
+                        if stateful == 'False':
+                            response = send_message_to_analyst(session=session, prompt_text=prompt)
+                        else:
+                            response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
+                        if "error" in response:
+                            st.error(f"LLM processing failed: {response['error']}")
+                        else:
+                            content = response["message"]["content"]
+                            display_analyst_content(content=content,obj_name=obj_name)
+                            st.session_state.messages.append({"role": "assistant", "content": content})
+                    except Exception as e:
+                        st.error(f"Failed to get full response from LLM due to an earlier error: {e}")
+            
+    else:
+        try:
+            st.session_state.messages.append(
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
+            )
+        except Exception as e: 
+            st.error(f"error getting access to session {e}")
+    
+        with st.chat_message("assistant"):
+            with st.spinner("Cortex LLM is thinking... This may take a moment for complex analysis."):
+                try:
+                    # Call the updated send_message_to_analyst function
+                    if stateful == 'False':
+                        response = send_message_to_analyst(session=session, prompt_text=prompt)
+                    else:
+                        response = send_message_to_analyst(session=session, prompt_text= stateful+ prompt)
+                    if "error" in response:
+                        st.error(f"LLM processing failed: {response['error']}")
+                    else:
+                        content = response["message"]["content"]
+                        display_analyst_content(content=content)
+                        st.session_state.messages.append({"role": "assistant", "content": content})
+                except Exception as e:
+                    st.error(f"Failed to get full response from LLM due to an earlier error: {e}")
 
+# --- Analyst Interaction Functions ---
 def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
     """
     Sends a text prompt to a Snowflake Cortex LLM (e.g., snowflake-arctic)
@@ -310,11 +318,44 @@ def send_message_to_analyst(session: Session, prompt_text: str) -> dict:
         st.error(f"Error calling Cortex LLM for analysis: {e}")
         return {"error": f"Error calling Cortex LLM: {e}"}
     
-def display_analyst_content(content: list, message_index: int = None,query_name: str = None) -> None:
+# --- Display Analyst prompt response ---
+def display_analyst_content(content: list, message_index: int = None,obj_name: str = None) -> None:
     effective_message_index = message_index if message_index is not None else len(st.session_state.get("messages", []))
     for item_index, item in enumerate(content):
         if item["type"] == "text":
-            st.markdown(item["text"])
+            response = item["text"]
+            st.markdown(response)
+            if obj_name is not None: 
+
+                # Add button to create recommended object if a SQL definition is clear
+                # This assumes 'analysis['suggestions']' might contain the SQL or you parse it.
+                # For a real implementation, you'd want a more robust way to extract the SQL
+                # from the LLM's free-form text response. Let's assume it's in an 'item' property
+                # in your current `display_analyst_content` if it's type "sql".
+                # For a simpler demo, let's make a generic button.
+        
+                # A placeholder for extracting SQL from the AI's suggestion text
+                # This is very naive and would need a robust regex or parsing for production
+                recommended_sql_match = re.search(r"```sql\n(.*?)```", response, re.DOTALL)
+                if recommended_sql_match:
+                    recommended_sql = recommended_sql_match.group(1).strip()
+                    st.subheader("Recommended Object Creation:")
+                    object_type_option = st.radio(f"Create as for {obj_name}:", ["View", "Table"], key=f"obj_type_{obj_type}")
+                    if object_type_option == "Table":
+                        replicate_data_option = st.checkbox("Replicate Data (CREATE TABLE AS SELECT)", key=f"replicate_data_{obj_name}")
+                    else:
+                        replicate_data_option = False # Not applicable for views
+        
+                    if st.button(f"Create Recommended {object_type_option} for {obj_name}", key=f"create_{object_type_option}_{obj_name}"):
+                        create_ai_recommended_object(
+                            session,
+                            object_type_option,
+                            obj_name, # Use original name as base for AI_ prefix
+                            recommended_sql,
+                            current_audit_context['database'],
+                            current_audit_context['schema'],
+                            replicate_data_option
+                        )
         elif item["type"] == "suggestions": # This type might not be directly returned by COMPLETE, but kept for compatibility
             suggestion_expander_key = f"expander_sugg_{effective_message_index}_{item_index}"
             with st.expander("Suggestions", expanded=True, key=suggestion_expander_key):
@@ -323,6 +364,7 @@ def display_analyst_content(content: list, message_index: int = None,query_name:
                     # If they were structured (e.g., from former API), you might parse them.
                     st.markdown(f"- {suggestion_text}")
         elif item["type"] == "sql":
+            st.markdown('sql')
             sql_expander_key = f"expander_sql_{effective_message_index}_{item_index}"
             results_expander_key = f"expander_results_{effective_message_index}_{item_index}"
             with st.expander("SQL Query", expanded=False, key=sql_expander_key):
@@ -338,10 +380,154 @@ def display_analyst_content(content: list, message_index: int = None,query_name:
                             st.write("SQL query ran successfully but returned no data.")
             except Exception as e:
                 st.error(f"Failed to execute or display SQL query results: {e}")
+
+            
         else:
             st.write(f"Unsupported content type: {item['type']}")
             st.json(item)
 
+#  --- Confirmation creation / replication statement ---
+def confirm_action(action_key: str, message: str) -> bool:
+    """
+    Displays a confirmation message and returns True if confirmed, False otherwise.
+    Uses st.session_state to manage the confirmation flow across reruns.
+    """
+    # Initialize confirmation state for this specific action
+    if f'confirm_{action_key}' not in st.session_state:
+        st.session_state[f'confirm_{action_key}'] = False
+
+    # If action is not yet confirmed, show confirmation UI
+    if not st.session_state[f'confirm_{action_key}']:
+        st.warning(message)
+        col1, col2 = st.columns([1, 5])
+        with col1:
+            if st.button("Confirm", key=f'confirm_yes_{action_key}'):
+                st.session_state[f'confirm_{action_key}'] = True
+                st.experimental_rerun() # Rerun to hide confirmation and proceed
+        with col2:
+            if st.button("Cancel", key=f'confirm_no_{action_key}'):
+                st.session_state[f'confirm_{action_key}'] = False # Explicitly set to false
+                st.experimental_rerun() # Rerun to clear warning
+        return False # Action not yet confirmed
+
+    # If action was confirmed in a previous rerun, reset state and proceed
+    else:
+        st.session_state[f'confirm_{action_key}'] = False # Reset for future use
+        return True # Action is confirmed
+    
+# --- AI Recommended Object Creation ---
+def create_ai_recommended_object(session: Session, object_type: str, object_name: str, definition_sql: str, target_db: str, target_schema: str, replicate_data: bool = False):
+    """
+    Creates an AI-recommended SQL object (View or Table) prefixed with 'ai_'.
+    If object_type is 'TABLE' and replicate_data is True, it will create a table as SELECT from the definition_sql.
+    Otherwise, it creates a view from definition_sql.
+    """
+    full_object_name = f'"{target_db}"."{target_schema}"."AI_{object_name.upper()}"'
+    
+    if object_type.upper() == 'TABLE':
+        if replicate_data:
+            # Create table as select, replicating data
+            create_sql = f"CREATE OR REPLACE TABLE {full_object_name} AS {definition_sql}"
+            confirmation_message = f"**Confirm Action:** Are you sure you want to create or replace table `{full_object_name}` with data replicated from the recommended SQL? This will incur compute costs."
+        else:
+            st.error("For AI-recommended TABLES, the 'replicate data' option is typically required to create it 'AS SELECT'. For an empty table based on the structure, specific DDL from AI is needed, or a 'CREATE TABLE ... LIKE' operation which is outside current scope.")
+            return False # Exit if not replicating data for tables
+    elif object_type.upper() == 'VIEW':
+        create_sql = f"CREATE OR REPLACE VIEW {full_object_name} AS {definition_sql}"
+        confirmation_message = f"**Confirm Action:** Are you sure you want to create or replace view `{full_object_name}`?"
+    else:
+        st.error(f"Unsupported object type for creation: {object_type}. Only 'TABLE' and 'VIEW' are supported.")
+        return False
+
+    if confirm_action(f"create_ai_object_{object_name}", confirmation_message):
+        try:
+            st.info(f"Creating {object_type.lower()} `{full_object_name}`...")
+            session.sql(create_sql).collect()
+            st.success(f"Successfully created {object_type.lower()} `{full_object_name}`.")
+            st.code(create_sql, language='sql')
+            return True
+        except Exception as e:
+            st.error(f"Failed to create {object_type.lower()} `{full_object_name}`: {e}")
+            return False
+    else:
+        st.info("Action cancelled by user.")
+        return False
+    
+# --- Schema Cloning on AI Recommendations ---
+def clone_and_adjust_schema(session: Session, source_db: str, source_schema: str, recommendation_prompt: str):
+    """
+    Clones the source schema to a new 'ai_recommendation_' prefixed schema.
+    Then, sends a prompt to Cortex AI to get SQL DDL recommendations for adjustments within the cloned schema.
+    """
+    timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    cloned_schema_name = f'AI_RECOMMENDED_{source_schema.upper()}_{timestamp}'
+    full_cloned_schema_path = f'"{source_db}"."{cloned_schema_name}"'
+
+    clone_sql = f'CREATE SCHEMA IF NOT EXISTS {full_cloned_schema_path} CLONE "{source_db}"."{source_schema}" WITH MANAGED ACCESS;'
+    
+    confirmation_message = f"**Confirm Action:** Are you sure you want to clone schema `{source_db}`.`{source_schema}` to `{full_cloned_schema_path}`? This will create a copy of all tables/views and may incur storage costs."
+    
+    if confirm_action(f"clone_schema_{source_schema}", confirmation_message):
+        try:
+            st.info(f"Cloning schema `{source_db}`.`{source_schema}` to `{full_cloned_schema_path}`...")
+            session.sql(clone_sql).collect()
+            st.success(f"Schema `{full_cloned_schema_path}` cloned successfully.")
+            st.code(clone_sql, language='sql')
+
+            st.subheader(f"Requesting AI Recommendations for Cloned Schema: `{full_cloned_schema_path}`")
+            st.info("Cortex AI will now analyze your request and provide DDL for adjustments to the cloned schema.")
+
+            # Construct the prompt for the LLM to get DDL recommendations
+            llm_prompt = f"""
+            I have cloned the schema '{source_db}.{source_schema}' to a new schema called '{full_cloned_schema_path}'.
+            Based on the following data model recommendations you previously provided:
+            ---
+            {recommendation_prompt}
+            ---
+            
+            Please generate **Snowflake SQL DDL statements** to implement these recommendations directly within the cloned schema `{full_cloned_schema_path}`.
+            Focus on CREATE, ALTER, DROP, or other DDL to adjust the tables, views, and relationships.
+            Prefix all new objects with 'ai_'.
+            Ensure all generated SQL statements are fully qualified with `{full_cloned_schema_path}`.
+            Present the SQL in a markdown code block. Do NOT include any introductory or concluding text, only the SQL.
+            """
+
+            with st.spinner("Asking Cortex AI for DDL recommendations for the cloned schema..."):
+                llm_response = send_message_to_analyst(session=session, prompt_text=llm_prompt)
+                
+                if "error" in llm_response:
+                    st.error(f"Failed to get DDL recommendations from Cortex AI: {llm_response['error']}")
+                elif llm_response.get("message") and llm_response["message"].get("content"):
+                    ai_content = llm_response["message"]["content"][0].get("text", "")
+                    st.subheader("Cortex AI Recommended DDL for Cloned Schema:")
+                    st.code(ai_content, language='sql')
+
+                    # Option to apply the recommended DDL
+                    if ai_content and "CREATE" in ai_content.upper() or "ALTER" in ai_content.upper() or "DROP" in ai_content.upper():
+                        if confirm_action(f"apply_ddl_{cloned_schema_name}", f"**Confirm Action:** Are you sure you want to apply the above AI-recommended DDL changes to `{full_cloned_schema_path}`?"):
+                            try:
+                                # Split SQL statements and execute them
+                                # Simple split, might need more robust parsing for complex SQL
+                                statements = [s.strip() for s in ai_content.split(';') if s.strip()]
+                                for stmt in statements:
+                                    if stmt:
+                                        session.sql(stmt).collect()
+                                st.success(f"Successfully applied AI-recommended DDL to `{full_cloned_schema_path}`.")
+                            except Exception as e:
+                                st.error(f"Failed to apply AI-recommended DDL to `{full_cloned_schema_path}`: {e}")
+                    else:
+                        st.info("No executable DDL statements were recommended by Cortex AI, or the response was not in an expected format.")
+                else:
+                    st.info("Cortex AI did not provide DDL recommendations for the cloned schema.")
+
+            return True
+        except Exception as e:
+            st.error(f"Failed to clone schema `{source_db}`.`{source_schema}`: {e}")
+            return False
+    else:
+        st.info("Schema cloning cancelled by user.")
+        return False
+    
 # --- Utility Functions ---
 def fetch_data(session, query):
     """Executes a SQL query and returns a Pandas DataFrame."""
@@ -352,6 +538,7 @@ def fetch_data(session, query):
         st.error(f"Error executing query: {query}\n{e}")
         return pd.DataFrame()
 
+# --- analyse text quality ---
 def analyze_text_with_cortex(session, text, prompt_suffix):
     """Analyzes text using Snowflake Cortex Analyst with a dynamic prompt."""
     try:
@@ -369,7 +556,7 @@ def analyze_text_with_cortex(session, text, prompt_suffix):
     except Exception as e:
         return {"error": f"Error during Cortex analysis for {prompt_suffix}: {e}"}
 
-
+# --- analyse python quality ---
 def analyze_python_with_cortex(session, python_code):
     """Analyzes Python using Snowflake Cortex for style and organization."""
     try:
@@ -391,6 +578,7 @@ def analyze_python_with_cortex(session, python_code):
     except Exception as e:
         return {"error": f"Error during Cortex Python analysis: {e}"}
 
+# --- Session multiple element State reset, clear the Ux ---
 def reset_session_state():
     """Reset important session state elements."""
     st.session_state.messages = []  # List to store conversation messages
@@ -400,6 +588,7 @@ def reset_session_state():
         {}
     )  # Dictionary to store feedback submission for each request
 
+# --- Historic Conversation Display ---
 def display_conversation():
     """
     Display the conversation history between the user and the assistant.
@@ -410,6 +599,7 @@ def display_conversation():
         with st.chat_message(role):
             display_analyst_content(content=content)
 
+# --- Stateful Conversation ( snowflake is inittially stateless) ---
 def stateful_conversation():
     text_appended = ''
     if len(st.session_state.messages) == 0:
@@ -428,6 +618,7 @@ def stateful_conversation():
             st.warning("Conversation is getting long. Consider clearing history for better performance. summarizing the conversation.")
     return text_appended
 
+# --- Discovery Functions for database objects---
 def list_scriptable_objects(
     session: Session, 
     database_name: str, 
@@ -493,6 +684,7 @@ def list_scriptable_objects(
     logging.info(f"Discovery finished. Found {len(discovered_objects)} potential objects.")
     return discovered_objects
 
+# --- Scrape database Grants ---
 def get_direct_grants(session: Session, object_type: str, fqn: str) -> List[Dict]:
     """
     Gets the direct grants for a specific Snowflake object.
@@ -518,6 +710,7 @@ def get_direct_grants(session: Session, object_type: str, fqn: str) -> List[Dict
         logging.error(f"Could not get grants for {fqn}. Your role may lack privileges. Error: {e.message.strip()}")
     return grants
 
+# --- Scrape DDL for Objects ---
 def scrape_object_definitions(
     session: Session, 
     database_name: str, 
@@ -565,6 +758,7 @@ def scrape_object_definitions(
     logging.info(f"Finished scraping. Retrieved {len(scraped_definitions)} definitions.")
     return scraped_definitions
 
+# --- Deduce the purpose of an object up to table columns ---
 def get_cortex_summary(session: Session, object_definition: str) -> str:
     """
     Uses the application's existing Cortex logic to generate a summary of an object's purpose.
@@ -607,6 +801,7 @@ def get_cortex_summary(session: Session, object_definition: str) -> str:
     
     return "*AI summary could not be generated.*"
 
+# --- Generate Technical Documentation from explicit content, scraped code and generated YAML---
 def generate_technical_documentation(
     semantic_model_yaml: str, 
     object_definitions: List[Dict], 
@@ -702,7 +897,7 @@ def generate_technical_documentation(
 
     return "\n".join(doc_parts)
 
-# --- Streamlit App ---
+# ------------------------------------------------ STREAMLIT APP ------------------------------------------------
 st.set_page_config(layout="wide")
 st.title("Snowflake Database Audit Tool ❄️")
 
@@ -990,7 +1185,7 @@ if st.sidebar.button("Run Audit"):
                 st.info("No tables or views found based on the current scope and filters, or an error occurred fetching them.")
             st.markdown("---")
 
-    # --- 2. Workflow Dictionary (Tasks, Streams, Pipes) ---
+    # --- 2. Workflow Dictionary (Tasks, Streams, Pipes) ---    ------------------------ work in progress, integrate snowpipe
     if include_workflow_dictionary:
         with st.spinner("Generating Workflow Dictionary..."):
             st.markdown("## 🔁 Workflow Dictionary")
@@ -1157,7 +1352,7 @@ if st.sidebar.button("Run Audit"):
         if not discovered_objects:
             st.info("No script objects (Views, Procedures, etc.) were found or are accessible in the specified schema.")
         else:
-            # Step 2: EXTRACT the DDL for the objects we found.
+             # Step 2: EXTRACT the DDL for the objects we found.
             with st.spinner(f"Scraping definitions for {len(discovered_objects)} objects..."):
                 all_definitions = scrape_object_definitions(
                     session=session,
@@ -1175,28 +1370,30 @@ if st.sidebar.button("Run Audit"):
                 obj_def = obj['definition']
                 obj_lang = obj.get('language', 'SQL')
 
-                with st.expander(f"**{obj_type}:** {obj_name} ({obj_lang})"):
-                    st.code(obj_def, language=obj_lang.lower())
                     
-                    analysis_prompt = f"""
-                    Please perform a detailed analysis of the following Snowflake object.
-                    Object Name: '{obj_name}'
-                    Object Type: {obj_type}
-                    Language: {obj_lang}
+                analysis_prompt = f"""
+                Please perform a detailed analysis of the following Snowflake object.
+                Object Name: '{obj_name}'
+                Object Type: {obj_type}
+                Language: {obj_lang}
 
-                    Analyze the code for correctness, performance, style, and adherence to Snowflake best practices.
-                    Provide a summary of its purpose and a list of actionable suggestions for improvement.
-
-                    --- CODE DEFINITION ---
-                    {obj_def}
-                    --- END CODE DEFINITION ---
-                    """
-                    
-                    process_analyst_message(
-                        session=session,
-                        prompt=analysis_prompt,
-                        semantic_model_path_for_info=st.session_state.get('generated_yaml_path') 
-                    )
+                Analyze the code for correctness, performance, style, and adherence to Snowflake best practices.
+                Provide a summary of its purpose and a list of actionable suggestions for improvement.
+                
+                --- CODE DEFINITION ---
+                {obj_def}
+                --- END CODE DEFINITION ---
+                Make sure to add the recommended sql ddl statement as part of your suggestion
+                """
+        
+                process_analyst_message(
+                    session=session,
+                    prompt=analysis_prompt,
+                    obj_type = obj_type,
+                    obj_name = obj_name,
+                    obj_def = obj_def,
+                    obj_lang = obj_lang
+                )
 
         st.markdown("---")
     
